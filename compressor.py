@@ -8,10 +8,14 @@ Anv: python3 compressor.py -q "fraga" -f dokument.txt [--budget 4000]
      python3 compressor.py -q "fraga" -u https://exempel.se [--budget 4000]
 """
 import argparse
+import ipaddress
 import json
 import math
+import os
 import re
+import socket
 import sys
+import urllib.parse
 import urllib.request
 
 EMBED_URL = "http://localhost:11434/api/embed"
@@ -95,10 +99,43 @@ def compress(query, document, budget_chars=4000):
     }
 
 
+ALLOW_PRIVATE = os.environ.get("COMPRESSOR_ALLOW_PRIVATE") == "1"
+MAX_FETCH_BYTES = 2000000
+ALLOWED_FILE_ROOTS = ("/home/openclaw/projects", "/tmp")
+
+
+def _is_private_host(host):
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return True
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return True
+    return False
+
+
+def safe_file_path(path):
+    """Tillat bara filer under godkanda rotkataloger (skyddar hemligheter)."""
+    real = os.path.realpath(path)
+    if not any(real == root or real.startswith(root + os.sep) for root in ALLOWED_FILE_ROOTS):
+        raise ValueError("filen ligger utanfor godkanda kataloger")
+    return real
+
+
 def fetch_url(url):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("bara http och https tillats")
+    if not ALLOW_PRIVATE and _is_private_host(parsed.hostname or ""):
+        raise ValueError("privata adresser ar blockerade (satt COMPRESSOR_ALLOW_PRIVATE=1 for lokala tester)")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; ContextCompressor/0.1)"})
     with urllib.request.urlopen(req, timeout=60) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
+        html = resp.read(MAX_FETCH_BYTES).decode("utf-8", errors="replace")
     html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
     text = re.sub(r"(?s)<[^>]+>", " ", html)
     text = text.replace("&nbsp;", " ")
@@ -114,15 +151,19 @@ def main():
     ap.add_argument("-u", "--url", help="webbadress")
     ap.add_argument("-b", "--budget", type=int, default=4000, help="teckenbudget for utdrag (default 4000)")
     args = ap.parse_args()
-    if args.file:
-        with open(args.file, encoding="utf-8") as fh:
-            doc = fh.read()
-        source = args.file
-    elif args.url:
-        doc = fetch_url(args.url)
-        source = args.url
-    else:
-        ap.error("ange --file eller --url")
+    try:
+        if args.file:
+            with open(safe_file_path(args.file), encoding="utf-8") as fh:
+                doc = fh.read()
+            source = args.file
+        elif args.url:
+            doc = fetch_url(args.url)
+            source = args.url
+        else:
+            ap.error("ange --file eller --url")
+    except (ValueError, OSError) as exc:
+        print("SAKERHETSBLOCKERING: " + str(exc), file=sys.stderr)
+        sys.exit(2)
     out = compress(args.query, doc, budget_chars=args.budget)
     out["source"] = source
     json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
