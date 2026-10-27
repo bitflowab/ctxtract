@@ -66,13 +66,33 @@ def est_tokens(s):
     return max(1, len(s) // 4)
 
 
+def keyword_prefilter(query, chunks, max_to_embed=100):
+    """Rangorda chunkar mot frågan med enkel nyckelords-matching.
+
+    Används bara vid stora dokument (>50 chunkar) för att skicka färre
+    texter till embeddings. Returnerar högst max_to_embed chunkar.
+    """
+    terms = set(w for w in re.findall(r"[a-z0-9åäö]+", query.lower()) if len(w) > 2)
+
+    def kw_score(chunk):
+        text = chunk["text"].lower()
+        return sum(text.count(t) for t in terms)
+
+    ranked = sorted(range(len(chunks)), key=lambda i: (-kw_score(chunks[i]), i))
+    keep = set(ranked[:max_to_embed])
+    return [c for i, c in enumerate(chunks) if i in keep]
+
+
 def compress(query, document, budget_chars=4000):
     chunks = chunk_document(document)
     if not chunks:
         return {"query": query, "excerpts": [], "stats": {"original_chars": 0}}
-    embs = embed([query] + [c["text"] for c in chunks])
+    candidates = chunks
+    if len(chunks) > 50:
+        candidates = keyword_prefilter(query, chunks)
+    embs = embed([query] + [c["text"] for c in candidates])
     qvec, cvecs = embs[0], embs[1:]
-    scored = sorted(((cosine(qvec, v), c) for c, v in zip(chunks, cvecs)), key=lambda p: p[0], reverse=True)
+    scored = sorted(((cosine(qvec, v), c) for c, v in zip(candidates, cvecs)), key=lambda p: p[0], reverse=True)
     selected, used = [], 0
     for score, c in scored:
         if used >= budget_chars:
