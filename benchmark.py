@@ -37,7 +37,9 @@ for name, url, query, expect in TESTS:
     rows.append((name, saving, hits, len(expect), lat))
     print(f"{name}: original {s['original_chars']} tecken -> sparar {saving} % | traff {hits}/{len(expect)} | {lat} s")
     with open("/home/openclaw/projects/events.jsonl", "a") as f:
-        f.write(json.dumps({"ts": int(time.time()), "type": "benchmark", "name": name, "value": saving}) + "\n")
+        f.write(json.dumps({"ts": int(time.time()), "type": "benchmark", "name": name,
+                            "value": saving, "source_type": "webb",
+                            "in_chars": s["original_chars"], "out_chars": s["kept_chars"]}) + "\n")
 
 if rows:
     n = len(rows)
