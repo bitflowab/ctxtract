@@ -1,0 +1,31 @@
+{
+  "A_stort": {
+    "chunks": 900,
+    "sek": 34.29,
+    "vald": 4,
+    "nål_träff": true
+  },
+  "B_uthallighet": {
+    "anrop": 8,
+    "fel": 0,
+    "snitt_s": 15.76,
+    "p50_s": 15.74,
+    "p95_s": 16.5,
+    "max_s": 16.5
+  },
+  "C_samtidighet": {
+    "tradar": 4,
+    "anrop": 8,
+    "fel": 0,
+    "vaggtid_s": 125.82,
+    "genomstromning_anrop_per_s": 0.06,
+    "p95_s": 63.05
+  },
+  "D_edgefall": {
+    "tomt_dokument": "ok",
+    "jatteavsnitt": "ok (4.6 s)",
+    "tom_fråga": "ok"
+  },
+  "minne_max_mb": 35.0,
+  "fel_lista": []
+}
