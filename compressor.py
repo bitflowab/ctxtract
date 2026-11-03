@@ -8,6 +8,7 @@ Anv: python3 compressor.py -q "fraga" -f dokument.txt [--budget 4000]
      python3 compressor.py -q "fraga" -u https://exempel.se [--budget 4000]
 """
 import argparse
+import http.client
 import ipaddress
 import json
 import math
@@ -121,22 +122,82 @@ def compress(query, document, budget_chars=4000):
 
 ALLOW_PRIVATE = os.environ.get("COMPRESSOR_ALLOW_PRIVATE") == "1"
 MAX_FETCH_BYTES = 2000000
+MAX_REDIRECTS = 5
 ALLOWED_FILE_ROOTS = ("/home/openclaw/projects", "/tmp")
+
+# CGNAT/delat utrymme – passerar ipaddress.is_private men ar inte publikt.
+BLOCKED_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"),)
+
+
+def _resolve_all(host):
+    """Slag upp alla adresser for host; uppslagsfal tolkas som blockerat."""
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        raise ValueError("kunde inte sla upp varden (blockerat)")
+    addrs = [i[4][0] for i in infos]
+    if not addrs:
+        raise ValueError("kunde inte sla upp varden (blockerat)")
+    return addrs
+
+
+def _ip_is_blocked(ip):
+    """Blockera allt som inte ar en publik, global adress (SSRF-skydd)."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if any(ip in net for net in BLOCKED_NETWORKS):
+        return True
+    return not ip.is_global
 
 
 def _is_private_host(host):
+    """True om host (namn eller IP) pekar pa nagot annat an publik adress."""
     try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError:
+        return any(_ip_is_blocked(ipaddress.ip_address(a)) for a in _resolve_all(host))
+    except ValueError:
         return True
+
+
+def _resolve_and_pin(host, port):
+    """Slag upp host, validera ALLA adresser, pinna forsta (mot DNS-rebinding)."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        raise ValueError("kunde inte sla upp varden (blockerat)")
+    if not infos:
+        raise ValueError("kunde inte sla upp varden (blockerat)")
     for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            continue
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            return True
-    return False
+        ip = ipaddress.ip_address(info[4][0])
+        if not ALLOW_PRIVATE and _ip_is_blocked(ip):
+            raise ValueError("privata adresser ar blockerade (satt COMPRESSOR_ALLOW_PRIVATE=1 for lokala tester)")
+    return infos[0][4][0]
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Ansluter till ett forhand verifierat IP (DNS-rebinding-skydd)."""
+
+    def __init__(self, host, port, ip, timeout=60):
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Samma som ovan men med TLS; SNI/cert valideras mot vrdnamnet."""
+
+    def __init__(self, host, port, ip, timeout=60):
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
 def safe_file_path(path):
@@ -148,14 +209,47 @@ def safe_file_path(path):
 
 
 def fetch_url(url):
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("bara http och https tillats")
-    if not ALLOW_PRIVATE and _is_private_host(parsed.hostname or ""):
-        raise ValueError("privata adresser ar blockerade (satt COMPRESSOR_ALLOW_PRIVATE=1 for lokala tester)")
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; ContextCompressor/0.1)"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        html = resp.read(MAX_FETCH_BYTES).decode("utf-8", errors="replace")
+    """Hamta sida med validering per omdirigering + pinnat IP per anrop."""
+    current = url
+    html = None
+    for _hop in range(MAX_REDIRECTS + 1):
+        parsed = urllib.parse.urlparse(current)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("bara http och https tillats")
+        host = parsed.hostname
+        if not host:
+            raise ValueError("ogiltig adress")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        ip = _resolve_and_pin(host, port)  # validerar alla adresser, pinna forsta
+        target = parsed.path or "/"
+        if parsed.params:
+            target += ";" + parsed.params
+        if parsed.query:
+            target += "?" + parsed.query
+        if parsed.scheme == "https":
+            conn = _PinnedHTTPSConnection(host, port, ip)
+        else:
+            conn = _PinnedHTTPConnection(host, port, ip)
+        try:
+            conn.request("GET", target, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; ContextCompressor/0.1)",
+                "Accept": "*/*",
+            })
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location")
+                if not loc:
+                    raise ValueError("omdirigering utan mal")
+                current = urllib.parse.urljoin(current, loc)
+                continue  # nasta hopp valideras innan anslutning
+            if resp.status >= 400:
+                raise ValueError("hamtning misslyckades (HTTP %d)" % resp.status)
+            html = resp.read(MAX_FETCH_BYTES).decode("utf-8", errors="replace")
+            break
+        finally:
+            conn.close()
+    if html is None:
+        raise ValueError("for manga omdirigeringar")
     html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
     text = re.sub(r"(?s)<[^>]+>", " ", html)
     text = text.replace("&nbsp;", " ")
